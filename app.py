@@ -7,6 +7,11 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 app = FastAPI(title="Discador IA Orquestrador")
 
 # ===== Config =====
@@ -214,3 +219,4 @@ async def dizparos_webhook(req: Request):
         sb.table("contacts").update({"status": "done"}).eq("id", contact_id).execute()
 
     return {"ok": True}
+
