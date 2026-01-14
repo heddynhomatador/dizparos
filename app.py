@@ -10,6 +10,17 @@ from supabase import create_client, Client
 # ✅ TEM que estar aqui, antes dos decorators
 app = FastAPI(title="Discador IA Backend")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # depois a gente trava isso
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # ===== Config =====
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -63,14 +74,7 @@ def root():
 def health():
     return {"ok": True}
 
-@app.post("/webhook/dizparos")
-async def dizparos_webhook(request: Request):
-    body = await request.json()
 
-    print("📞 Webhook recebido do Dizparos:")
-    print(body)
-
-    return {"status": "received"}
 
 async def dizparos_start_call(phone_e164: str) -> Dict[str, Any]:
     if not DIZPAROS_TOKEN:
@@ -179,9 +183,12 @@ async def tick(body: TickBody):
     return {"ok": True, "results": out}
 
 
-@app.post("/webhooks/dizparos")
+@app.post("/webhook/dizparos")
 async def dizparos_webhook(req: Request):
+    # Se você quiser travar por segredo depois, mantém isso.
+    # Se ainda não configurou segredo no Dizparos, pode deixar DIZPAROS_WEBHOOK_SECRET vazio.
     verify_webhook(req)
+
     payload = await req.json()
     sb = get_supabase()
 
@@ -190,39 +197,70 @@ async def dizparos_webhook(req: Request):
 
     diz_call_id = data.get("call_id") or payload.get("call_id") or payload.get("id")
     if not diz_call_id:
+        # salva evento mesmo assim
+        sb.table("call_events").insert({
+            "call_id": None,
+            "event_type": str(event_type),
+            "payload": payload
+        }).execute()
         raise HTTPException(status_code=400, detail="call_id ausente")
 
-    call_rows = sb.table("calls").select("id, contact_id").eq("dizparos_call_id", diz_call_id).limit(1).execute().data
-    call_id = call_rows[0]["id"] if call_rows else None
+    # acha call
+    call_rows = sb.table("calls") \
+        .select("id, contact_id") \
+        .eq("dizparos_call_id", diz_call_id) \
+        .limit(1) \
+        .execute().data
 
+    call_id = call_rows[0]["id"] if call_rows else None
+    contact_id = call_rows[0]["contact_id"] if call_rows else None
+
+    # salva evento bruto
     sb.table("call_events").insert({
         "call_id": call_id,
         "event_type": str(event_type),
         "payload": payload
     }).execute()
 
-    if not call_rows:
-        return {"ok": True, "warning": "call não encontrada ainda"}
+    # se ainda não existe call (webhook chegou antes de linkar), não quebra
+    if not call_id:
+        return {"ok": True, "warning": "call não encontrada ainda", "dizparos_call_id": diz_call_id}
 
-    contact_id = call_rows[0]["contact_id"]
     et = str(event_type).lower()
 
-    if et in ["answered", "2000"]:
+    # status
+    if "answered" in et or et in ["2000"]:
         sb.table("calls").update({"status": "answered"}).eq("id", call_id).execute()
-    elif et in ["transferred", "2001"]:
+
+    elif "transferred" in et or et in ["2001"]:
         sb.table("calls").update({"status": "transferred"}).eq("id", call_id).execute()
-    elif et in ["finished", "2002"]:
+
+    elif "finished" in et or "completed" in et or et in ["2002"]:
+        # placeholders de resumo e interesse (sem transcrição por enquanto)
+        summary = data.get("summary") or payload.get("summary") or None
+        interested = data.get("interested") or payload.get("interested") or None
+
         sb.table("calls").update({
             "status": "finished",
             "duration": data.get("duration"),
             "cost": data.get("cost"),
             "recording_url": data.get("recording_url"),
+            "summary": summary,
+            "interested": interested,
             "finished_at": now_utc_iso(),
         }).eq("id", call_id).execute()
 
-        sb.table("contacts").update({"status": "done"}).eq("id", contact_id).execute()
+        if contact_id:
+            sb.table("contacts").update({"status": "done"}).eq("id", contact_id).execute()
+
+    elif "failed" in et:
+        sb.table("calls").update({"status": "failed"}).eq("id", call_id).execute()
+        if contact_id:
+            sb.table("contacts").update({"status": "failed"}).eq("id", contact_id).execute()
 
     return {"ok": True}
+
+
 
 
 
