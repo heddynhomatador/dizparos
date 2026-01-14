@@ -7,12 +7,8 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-app = FastAPI(title="Discador IA Orquestrador")
+# ✅ TEM que estar aqui, antes dos decorators
+app = FastAPI(title="Discador IA Backend")
 
 # ===== Config =====
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -21,7 +17,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 DIZPAROS_ENDPOINT = os.getenv("DIZPAROS_ENDPOINT", "https://api.dizparos.com/v1/messaging/send").rstrip("/")
 DIZPAROS_TOKEN = os.getenv("DIZPAROS_TOKEN", "")
 
-TRANSFER_DESTINATION = os.getenv("TRANSFER_DESTINATION", "")  # SIP do Eleven
+TRANSFER_DESTINATION = os.getenv("TRANSFER_DESTINATION", "")
 
 SIP_TRUNK_ADDRESS = os.getenv("SIP_TRUNK_ADDRESS", "")
 SIP_TRUNK_PORT = int(os.getenv("SIP_TRUNK_PORT", "5060"))
@@ -66,7 +62,6 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 async def dizparos_start_call(phone_e164: str) -> Dict[str, Any]:
     if not DIZPAROS_TOKEN:
@@ -219,4 +214,5 @@ async def dizparos_webhook(req: Request):
         sb.table("contacts").update({"status": "done"}).eq("id", contact_id).execute()
 
     return {"ok": True}
+
 
