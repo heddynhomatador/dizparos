@@ -4,67 +4,86 @@ from typing import Any, Dict, Optional, List
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-# ✅ TEM que estar aqui, antes dos decorators
+# =========================
+# App
+# =========================
 app = FastAPI(title="Discador IA Backend")
-
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # depois a gente trava isso
+    allow_origins=["*"],   # depois você trava pro domínio do lovable
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =========================
+# Env / Config
+# =========================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-# ===== Config =====
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+# Dizparos
+DIZPAROS_ENDPOINT = os.getenv("DIZPAROS_ENDPOINT", "https://api.dizparos.com/v1/messaging/send").strip()
+DIZPAROS_TOKEN = os.getenv("DIZPAROS_TOKEN", "").strip()
 
-DIZPAROS_ENDPOINT = os.getenv("DIZPAROS_ENDPOINT", "https://api.dizparos.com/v1/messaging/send").rstrip("/")
-DIZPAROS_TOKEN = os.getenv("DIZPAROS_TOKEN", "")
+# Transfer settings
+TRANSFER_DESTINATION = os.getenv("TRANSFER_DESTINATION", "").strip()
 
-TRANSFER_DESTINATION = os.getenv("TRANSFER_DESTINATION", "")
-
-SIP_TRUNK_ADDRESS = os.getenv("SIP_TRUNK_ADDRESS", "")
+# SIP trunk (ElevenLabs)
+SIP_TRUNK_ADDRESS = os.getenv("SIP_TRUNK_ADDRESS", "").strip()
 SIP_TRUNK_PORT = int(os.getenv("SIP_TRUNK_PORT", "5060"))
-SIP_TRUNK_USERNAME = os.getenv("SIP_TRUNK_USERNAME", "")
-SIP_TRUNK_PASSWORD = os.getenv("SIP_TRUNK_PASSWORD", "")
+SIP_TRUNK_USERNAME = os.getenv("SIP_TRUNK_USERNAME", "").strip()
+SIP_TRUNK_PASSWORD = os.getenv("SIP_TRUNK_PASSWORD", "").strip()
 
-DIZPAROS_WEBHOOK_SECRET = os.getenv("DIZPAROS_WEBHOOK_SECRET", "")
+# Webhook security (opcional)
+DIZPAROS_WEBHOOK_SECRET = os.getenv("DIZPAROS_WEBHOOK_SECRET", "").strip()
 
-supabase: Optional[Client] = None
+# Render port
+PORT = int(os.getenv("PORT", "10000"))
+
+_supabase: Optional[Client] = None
 
 
 def get_supabase() -> Client:
-    global supabase
-    if supabase is None:
+    global _supabase
+    if _supabase is None:
         if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-            raise RuntimeError("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY.")
-        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-    return supabase
+            raise RuntimeError("Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY no Render.")
+        _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    return _supabase
 
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def verify_webhook(req: Request):
+def verify_webhook(req: Request) -> None:
+    """
+    Se você configurar um secret no Dizparos, ele tem que vir no header x-webhook-secret.
+    Se você NÃO configurar secret no Dizparos, deixe DIZPAROS_WEBHOOK_SECRET vazio e a verificação é ignorada.
+    """
     if not DIZPAROS_WEBHOOK_SECRET:
         return
-    got = req.headers.get("x-webhook-secret", "")
+    got = (req.headers.get("x-webhook-secret") or "").strip()
     if got != DIZPAROS_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Webhook secret inválido")
 
 
+# =========================
+# Models
+# =========================
 class TickBody(BaseModel):
     campaign_id: Optional[str] = None
 
 
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def root():
     return {"ok": True, "service": "discador-ia-backend"}
@@ -72,18 +91,32 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "ts": now_utc_iso()}
 
 
-
+# ---------- Dizparos: start call ----------
 async def dizparos_start_call(phone_e164: str) -> Dict[str, Any]:
+    """
+    Doc: POST https://api.dizparos.com/v1/messaging/send
+    Body:
+    {
+      "channel": "voice",
+      "details": {
+        "to": "+55...",
+        "type": "transfer",
+        "transfer_destination": "...",
+        "transfer_sip_trunk": {...} # opcional
+      }
+    }
+    """
     if not DIZPAROS_TOKEN:
-        raise RuntimeError("DIZPAROS_TOKEN não configurado.")
+        raise RuntimeError("DIZPAROS_TOKEN não configurado no Render.")
     if not TRANSFER_DESTINATION:
-        raise RuntimeError("TRANSFER_DESTINATION não configurado.")
+        raise RuntimeError("TRANSFER_DESTINATION não configurado no Render.")
+    if not DIZPAROS_ENDPOINT:
+        raise RuntimeError("DIZPAROS_ENDPOINT não configurado no Render.")
 
     payload: Dict[str, Any] = {
-        "token": DIZPAROS_TOKEN,
         "channel": "voice",
         "details": {
             "to": phone_e164,
@@ -92,6 +125,7 @@ async def dizparos_start_call(phone_e164: str) -> Dict[str, Any]:
         },
     }
 
+    # se você quiser usar SIP trunk (ElevenLabs), preenche o bloco abaixo
     if SIP_TRUNK_ADDRESS:
         payload["details"]["transfer_sip_trunk"] = {
             "address": SIP_TRUNK_ADDRESS,
@@ -100,12 +134,20 @@ async def dizparos_start_call(phone_e164: str) -> Dict[str, Any]:
             "password": SIP_TRUNK_PASSWORD,
         }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(DIZPAROS_ENDPOINT, json=payload, headers={"Content-Type": "application/json"})
+    headers = {
+        "Content-Type": "application/json",
+        # Dizparos costuma aceitar token no body (como no seu painel), mas muitos aceitam também Authorization.
+        # Pra garantir, a gente manda NOS DOIS: body e header.
+        "Authorization": f"Bearer {DIZPAROS_TOKEN}",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(DIZPAROS_ENDPOINT, json=payload, headers=headers)
         r.raise_for_status()
         return r.json()
 
 
+# ---------- Tick: dispara ligações ----------
 @app.post("/tick")
 async def tick(body: TickBody):
     sb = get_supabase()
@@ -118,12 +160,13 @@ async def tick(body: TickBody):
     if not campaigns:
         return {"ok": True, "message": "Nenhuma campanha running."}
 
-    out: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
 
     for camp in campaigns:
         campaign_id = camp["id"]
         concurrency = int(camp.get("concurrency") or 5)
 
+        # quantas calls em progresso?
         in_prog = sb.table("calls").select("id", count="exact") \
             .eq("campaign_id", campaign_id) \
             .in_("status", ["created", "answered", "transferred"]) \
@@ -133,9 +176,10 @@ async def tick(body: TickBody):
         free_slots = max(concurrency - current, 0)
 
         if free_slots <= 0:
-            out.append({"campaign_id": campaign_id, "started": 0, "reason": "sem slots"})
+            results.append({"campaign_id": campaign_id, "started": 0, "errors": 0, "reason": "sem slots"})
             continue
 
+        # pega contatos pendentes
         contacts = sb.table("contacts") \
             .select("id, phone_e164, attempts") \
             .eq("campaign_id", campaign_id) \
@@ -151,6 +195,7 @@ async def tick(body: TickBody):
             phone = c["phone_e164"]
             attempts = int(c.get("attempts") or 0)
 
+            # cria registro de call (antes) pra rastrear
             call_row = sb.table("calls").insert({
                 "campaign_id": campaign_id,
                 "contact_id": contact_id,
@@ -158,6 +203,7 @@ async def tick(body: TickBody):
                 "created_at": now_utc_iso(),
             }).execute().data[0]
 
+            # marca contato como calling
             sb.table("contacts").update({
                 "status": "calling",
                 "attempts": attempts + 1,
@@ -166,101 +212,122 @@ async def tick(body: TickBody):
 
             try:
                 resp = await dizparos_start_call(phone)
-                diz_call_id = resp.get("call_id") or resp.get("id") or resp.get("data", {}).get("call_id")
+
+                # doc diz: call_id e messaging_id
+                diz_call_id = (
+                    resp.get("call_id")
+                    or resp.get("id")
+                    or resp.get("data", {}).get("call_id")
+                )
+
+                if not diz_call_id:
+                    raise RuntimeError(f"Resposta do Dizparos sem call_id: {resp}")
 
                 sb.table("calls").update({
-                    "dizparos_call_id": diz_call_id
+                    "dizparos_call_id": str(diz_call_id)
                 }).eq("id", call_row["id"]).execute()
 
                 started += 1
-            except Exception:
+
+            except Exception as e:
                 errors += 1
-                sb.table("calls").update({"status": "failed"}).eq("id", call_row["id"]).execute()
-                sb.table("contacts").update({"status": "failed"}).eq("id", contact_id).execute()
+                # falhou disparo
+                sb.table("calls").update({
+                    "status": "failed",
+                    "finished_at": now_utc_iso(),
+                }).eq("id", call_row["id"]).execute()
 
-        out.append({"campaign_id": campaign_id, "started": started, "errors": errors})
+                sb.table("contacts").update({
+                    "status": "failed"
+                }).eq("id", contact_id).execute()
 
-    return {"ok": True, "results": out}
+                # salva erro em call_events
+                sb.table("call_events").insert({
+                    "call_id": call_row["id"],
+                    "event_type": "start_failed",
+                    "payload": {"error": str(e), "phone": phone},
+                }).execute()
+
+        results.append({"campaign_id": campaign_id, "started": started, "errors": errors, "free_slots": free_slots})
+
+    return {"ok": True, "results": results}
 
 
-@app.post("/webhook/dizparos")
+# ---------- Webhook: recebe eventos do Dizparos ----------
+@app.post("/webhooks/dizparos")
 async def dizparos_webhook(req: Request):
-    # Se você quiser travar por segredo depois, mantém isso.
-    # Se ainda não configurou segredo no Dizparos, pode deixar DIZPAROS_WEBHOOK_SECRET vazio.
     verify_webhook(req)
-
     payload = await req.json()
     sb = get_supabase()
 
-    event_type = payload.get("type_description") or payload.get("type") or payload.get("event") or "unknown"
+    # doc:
+    # {
+    #   "webhook_event_id": "...",
+    #   "type": 2000|2001|2002,
+    #   "type_description": "answered|transferred|finished",
+    #   "data": { "call_id": "...", ... }
+    # }
+    t = payload.get("type")
+    desc = str(payload.get("type_description") or payload.get("event") or payload.get("type") or "unknown").lower()
     data = payload.get("data") or {}
 
     diz_call_id = data.get("call_id") or payload.get("call_id") or payload.get("id")
     if not diz_call_id:
-        # salva evento mesmo assim
+        # salva evento mesmo assim pra debug
         sb.table("call_events").insert({
             "call_id": None,
-            "event_type": str(event_type),
+            "event_type": f"unknown_no_call_id:{desc}",
             "payload": payload
         }).execute()
-        raise HTTPException(status_code=400, detail="call_id ausente")
+        return {"ok": True, "warning": "call_id ausente, evento salvo como debug"}
 
-    # acha call
+    # tenta achar call pelo dizparos_call_id
     call_rows = sb.table("calls") \
-        .select("id, contact_id") \
-        .eq("dizparos_call_id", diz_call_id) \
-        .limit(1) \
-        .execute().data
+        .select("id, contact_id, campaign_id") \
+        .eq("dizparos_call_id", str(diz_call_id)) \
+        .limit(1).execute().data
 
     call_id = call_rows[0]["id"] if call_rows else None
     contact_id = call_rows[0]["contact_id"] if call_rows else None
 
-    # salva evento bruto
+    # salva evento bruto SEMPRE
     sb.table("call_events").insert({
         "call_id": call_id,
-        "event_type": str(event_type),
+        "event_type": desc,
         "payload": payload
     }).execute()
 
-    # se ainda não existe call (webhook chegou antes de linkar), não quebra
-    if not call_id:
-        return {"ok": True, "warning": "call não encontrada ainda", "dizparos_call_id": diz_call_id}
+    # se o call ainda não existe, cria placeholder
+    # (acontece raro, mas é bom ter)
+    if not call_rows:
+        new_call = sb.table("calls").insert({
+            "dizparos_call_id": str(diz_call_id),
+            "status": "created",
+            "created_at": now_utc_iso(),
+        }).execute().data[0]
+        call_id = new_call["id"]
+        return {"ok": True, "warning": "call placeholder criado, aguarde o tick criar vínculo com contact"}
 
-    et = str(event_type).lower()
-
-    # status
-    if "answered" in et or et in ["2000"]:
+    # normaliza decisões por type
+    # 2000 answered / 2001 transferred / 2002 finished
+    if t == 2000 or "answered" in desc:
         sb.table("calls").update({"status": "answered"}).eq("id", call_id).execute()
 
-    elif "transferred" in et or et in ["2001"]:
+    elif t == 2001 or "transferred" in desc:
+        # doc: data.success
         sb.table("calls").update({"status": "transferred"}).eq("id", call_id).execute()
 
-    elif "finished" in et or "completed" in et or et in ["2002"]:
-        # placeholders de resumo e interesse (sem transcrição por enquanto)
-        summary = data.get("summary") or payload.get("summary") or None
-        interested = data.get("interested") or payload.get("interested") or None
-
+    elif t == 2002 or "finished" in desc or "completed" in desc:
         sb.table("calls").update({
             "status": "finished",
             "duration": data.get("duration"),
             "cost": data.get("cost"),
             "recording_url": data.get("recording_url"),
-            "summary": summary,
-            "interested": interested,
             "finished_at": now_utc_iso(),
         }).eq("id", call_id).execute()
 
+        # marca contato como done se existir
         if contact_id:
             sb.table("contacts").update({"status": "done"}).eq("id", contact_id).execute()
 
-    elif "failed" in et:
-        sb.table("calls").update({"status": "failed"}).eq("id", call_id).execute()
-        if contact_id:
-            sb.table("contacts").update({"status": "failed"}).eq("id", contact_id).execute()
-
-    return {"ok": True}
-
-
-
-
-
+    return {"ok": True, "call_id": call_id, "dizparos_call_id": str(diz_call_id)}
