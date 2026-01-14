@@ -127,26 +127,36 @@ async def dizparos_start_call(phone_e164: str) -> Dict[str, Any]:
 @app.post("/start_call")
 async def start_call(body: StartCallBody):
     """
-    Endpoint pra testar UMA ligação sem campanha.
+    Endpoint pra testar UMA ligação.
+    - Se vier campaign_id + contact_id: grava no Supabase e linka tudo.
+    - Se não vier: só chama o Dizparos e retorna a resposta (sem gravar no banco).
     """
     sb = get_supabase()
 
-    # cria um call “solto” opcionalmente vinculado
+    # 1) dispara a ligação primeiro (teste direto)
+    resp = await dizparos_start_call(body.to)
+    diz_call_id = resp.get("call_id") or resp.get("data", {}).get("call_id") or resp.get("id")
+
+    # 2) se não vier vínculo, não tenta escrever em calls (evita erro de NOT NULL / FK)
+    if not body.campaign_id or not body.contact_id:
+        return {
+            "ok": True,
+            "mode": "direct_test_no_db",
+            "dizparos_call_id": diz_call_id,
+            "dizparos_response": resp
+        }
+
+    # 3) agora sim grava no banco (com FKs válidas)
     call_row = sb.table("calls").insert({
         "campaign_id": body.campaign_id,
         "contact_id": body.contact_id,
         "status": "created",
         "created_at": now_utc_iso(),
+        "dizparos_call_id": diz_call_id,
     }).execute().data[0]
 
-    resp = await dizparos_start_call(body.to)
-    diz_call_id = resp.get("call_id") or resp.get("data", {}).get("call_id") or resp.get("id")
+    return {"ok": True, "mode": "db_linked", "call": call_row, "dizparos_response": resp}
 
-    sb.table("calls").update({
-        "dizparos_call_id": diz_call_id
-    }).eq("id", call_row["id"]).execute()
-
-    return {"ok": True, "call": call_row, "dizparos_response": resp}
 
 
 @app.post("/tick")
@@ -307,3 +317,4 @@ async def dizparos_webhook(req: Request):
             sb.table("contacts").update({"status": "done"}).eq("id", contact_id).execute()
 
     return {"ok": True}
+
