@@ -63,6 +63,15 @@ def root():
 def health():
     return {"ok": True}
 
+@app.post("/webhook/dizparos")
+async def dizparos_webhook(request: Request):
+    body = await request.json()
+
+    print("📞 Webhook recebido do Dizparos:")
+    print(body)
+
+    return {"status": "received"}
+
 async def dizparos_start_call(phone_e164: str) -> Dict[str, Any]:
     if not DIZPAROS_TOKEN:
         raise RuntimeError("DIZPAROS_TOKEN não configurado.")
@@ -214,5 +223,6 @@ async def dizparos_webhook(req: Request):
         sb.table("contacts").update({"status": "done"}).eq("id", contact_id).execute()
 
     return {"ok": True}
+
 
 
